@@ -5,11 +5,16 @@ include("../../fancy_toys.jl")
 
 name = "LLVMExtra"
 repo = "https://github.com/maleadt/LLVM.jl.git"
-version = v"0.0.13"
+version = v"0.0.14"
 
-# Collection of sources required to build attr
+llvm_versions = [v"11.0.1", v"12.0.1", v"13.0.1"]
+
+# Collection of sources required to build LLVMExtra
 sources = [GitSource(repo, "141adedf59bb868bca40b0b9ec1267127413de5c")]
 
+# These are the platforms we will build for by default, unless further
+# platforms are passed in on the command line
+platforms = expand_cxxstring_abis(supported_platforms(; experimental=true))
 
 # Bash recipe for building across all platforms
 script = raw"""
@@ -34,43 +39,73 @@ cmake -B build -S . -GNinja ${CMAKE_FLAGS[@]}
 ninja -C build -j ${nproc} install
 """
 
-function configure(julia_version, llvm_version)
-    # These are the platforms we will build for by default, unless further
-    # platforms are passed in on the command line
-    platforms = expand_cxxstring_abis(supported_platforms(; experimental=true))
+augment_platform_block = """
+    using Base.BinaryPlatforms
 
-    foreach(platforms) do p
-        BinaryPlatforms.add_tag!(p.tags, "julia_version", string(julia_version))
-    end
+    function augment_platform!(platform::Platform)
+        haskey(platform, "llvm_version") && return p
+
+        llvm_version = Base.libllvm_version
+
+        # does our LLVM build use assertions?
+        llvm_assertions = try
+            cglobal((:_ZN4llvm24DisableABIBreakingChecksE, Base.libllvm_path()), Cvoid)
+            false
+        catch
+            true
+        end
+
+        platform["llvm_version"] = if llvm_assertions
+            "\$(llvm_version.major).asserts"
+        else
+            "\$(llvm_version.major)"
+        end
+
+        return platform
+    end"""
+
+# determine exactly which tarballs we should build
+builds = []
+for llvm_version in llvm_versions, llvm_assertions in (false, true)
+    # Dependencies that must be installed before this package can be built
+    llvm_name = llvm_assertions ? "LLVM_full_assert_jll" : "LLVM_full_jll"
+    dependencies = [
+        BuildDependency(PackageSpec(name=llvm_name, version=llvm_version))
+    ]
 
     # The products that we will ensure are always built
     products = Product[
-        LibraryProduct(["libLLVMExtra-$(llvm_version.major)", "libLLVMExtra"], :libLLVMExtra),
+        LibraryProduct(["libLLVMExtra-$(llvm_version.major)", "libLLVMExtra"],
+                       :libLLVMExtra, dont_dlopen=true),
     ]
 
-    dependencies = [
-        BuildDependency(get_addable_spec("LLVM_full_jll", llvm_version))
-        #Dependency(PackageSpec(name="libLLVM_jll", version=v"9.0.1"))
-        # ^ is given through julia_version tag
-    ]
+    for platform in platforms
+        augmented_platform = deepcopy(platform)
+        augmented_platform["llvm_version"] = if llvm_assertions
+            "$(llvm_version.major).asserts"
+        else
+            "$(llvm_version.major)"
+        end
 
-    return platforms, products, dependencies
+        should_build_platform(triplet(augmented_platform)) || continue
+        push!(builds, (;
+            dependencies, products,
+            platforms=[augmented_platform],
+        ))
+    end
 end
 
-# TODO: Don't require build-id on LLVM version
-supported = (
-    (v"1.6", v"11.0.1+3"),
-    (v"1.7", v"12.0.0+0"),
-    (v"1.8", v"13.0.1+0"),
-    (v"1.9", v"13.0.1+0"),
-)
+# don't allow `build_tarballs` to override platform selection based on ARGS.
+# we handle that ourselves by calling `should_build_platform`
+non_platform_ARGS = filter(arg -> startswith(arg, "--"), ARGS)
 
-for (julia_version, llvm_version) in supported
-    platforms, products, dependencies = configure(julia_version, llvm_version)
+# `--register` should only be passed to the latest `build_tarballs` invocation
+non_reg_ARGS = filter(arg -> arg != "--register", non_platform_ARGS)
 
-    any(should_build_platform.(triplet.(platforms))) || continue
-
-    # Build the tarballs.
-    build_tarballs(ARGS, name, version, sources, script, platforms, products, dependencies;
-                   preferred_gcc_version=v"8", julia_compat="1.6")
+for (i,build) in enumerate(builds)
+    build_tarballs(i == lastindex(builds) ? non_platform_ARGS : non_reg_ARGS,
+                   name, version, sources, script,
+                   build.platforms, build.products, build.dependencies;
+                   preferred_gcc_version=v"8", julia_compat="1.6",
+                   augment_platform_block)
 end
